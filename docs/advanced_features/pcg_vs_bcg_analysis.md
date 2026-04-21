@@ -570,3 +570,128 @@ BCG 直接依赖 NVIDIA CUDA Runtime C API 的 Python 绑定 (`cuda.bindings.run
 | `rt.cudaStreamGetCaptureInfo` | 查询 capture 状态 | 无 |
 
 **核心障碍**: BCG 需要精细控制 CUDA stream capture 的 begin/end 来实现多段 capture，这是 NVIDIA CUDA Runtime 的专有能力。`torch_npu` 虽然提供了 `NPUGraph` 高层 API，但没有暴露底层 stream capture 控制接口。要适配 BCG 到 NPU，需要华为在 `torch_npu` 中实现等价的底层 stream capture API。
+
+
+
+Plan: 优化 Prompt 以触发专业 Agent/Skill
+
+ Context
+
+ 用户希望优化这条 prompt：
+
+ ▎ "这个sglang项目的pieceweise cuda graph和breakable cuda graph特性分别是怎么实现的？两者有没有关联与区别？华为ascend npu能适配吗？"
+
+ 使其能更好地触发已配置的专业 agents 和 skills，获得更高质量的回答。
+
+ 为什么原 prompt 效果一般
+
+ 1. 太笼统 — "怎么实现的"是开放问题，没有指明需要什么深度
+ 2. 没有触发意图信号 — 缺少 "research"、"explore"、"analyze" 等关键词
+ 3. 三个子问题混在一起 — PCG 实现、BCG 实现、NPU 适配，每个适合不同 agent/skill
+ 4. 没有指定输出格式 — 不知道要代码分析文档、对比表格、还是架构图
+
+ 可用的 Agents/Skills 及触发方式
+
+ ┌───────────────────────┬──────────────────────────────────────────────┬───────────────────────────────────────┐
+ │      Agent/Skill      │                   触发方式                   │              适用子问题               │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ Explore agent         │ 自动（探索性代码搜索时）                     │ PCG/BCG 代码实现细节                  │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ deep-research         │ /deep-research 或 "深度研究/research"        │ CUDA Graph 技术原理、NPU 适配可行性   │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ codebase-onboarding   │ /codebase-onboarding 或 "帮我理解这个代码库" │ sglang 整体架构概览                   │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ documentation-lookup  │ /documentation-lookup 或问 "怎么用/如何配置" │ PyTorch CUDA Graph API 文档           │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ exa-search            │ /exa-search 或 "搜索/查找最新"               │ 华为 Ascend NPU 最新的 torch_npu 支持 │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ architect agent       │ 自动（架构决策时）                           │ PCG vs BCG 架构对比分析               │
+ ├───────────────────────┼──────────────────────────────────────────────┼───────────────────────────────────────┤
+ │ python-reviewer agent │ 自动（Python 代码审查时）                    │ 审查 PCG/BCG 代码质量                 │
+ └───────────────────────┴──────────────────────────────────────────────┴───────────────────────────────────────┘
+
+ 优化后的 Prompt（三种场景）
+
+ 场景 A：单条精炼 Prompt（推荐）
+
+ /research sglang 项目中 Piecewise CUDA Graph (PCG) 和 Breakable CUDA Graph (BCG)
+ 的实现架构对比分析。请从以下维度深入分析：
+
+ 1. 代码实现：分别探索 PCG 和 BCG 的核心类、数据结构、调用链
+    （关注 piecewise_cuda_graph_runner.py、breakable_cuda_graph.py）
+ 2. 架构对比：分段策略、编译方式、内存管理、动态形状处理
+ 3. 华为 Ascend NPU 适配性：检查 npu_piecewise_backend.py 的实现，
+    分析 BCG 的 CUDA stream capture API 在 torch_npu 上的可用性
+
+ 请搜索 Ascend NPU 最新的 CUDA Graph 等效 API 支持情况。
+ 输出对比表格和架构图（用 ASCII/Mermaid）。
+
+ 触发的 Skills/Agents:
+ - /research → deep-research skill（主动触发）
+ - 代码探索关键词 → Explore agent（自动）
+ - "搜索 Ascend NPU" → exa-search skill（自动）
+ - "架构对比" → architect agent（自动）
+
+ 场景 B：拆分为多条 Prompt（最精确控制）
+
+ Prompt 1（代码探索）：
+ /explore 深入分析 sglang 中 Piecewise CUDA Graph 的完整实现：
+ - 核心类 PiecewiseCudaGraphRunner 和 CUDAPiecewiseBackend
+ - 图分割点（SPLIT_OPS）和编译流程
+ - capture 和 replay 的完整调用链
+ - KV cache 管理和 padding 策略
+
+ Prompt 2（代码探索）：
+ /explore 深入分析 sglang 中 Breakable CUDA Graph 的完整实现：
+ - BreakableCUDAGraph 和 BreakableCUDAGraphCapture 类
+ - @eager_on_graph 装饰器和 break_graph() 的工作机制
+ - stream fork/join 跟踪机制
+ - 与标准 CUDA Graph 的集成方式
+
+ Prompt 3（深度研究）：
+ /deep-research 华为 Ascend NPU 对 CUDA Graph 的支持现状：
+ 1. torch_npu 中 NPUGraph 的 API 完整度（对比 torch.cuda.CUDAGraph）
+ 2. Stream capture API（cudaStreamBeginCapture 等）是否已实现
+ 3. SGLang 已有的 NPU 适配（npu_piecewise_backend.py）策略
+ 4. Ascend CANN 软件栈中是否有 CUDA Graph 等效机制
+
+
+ Prompt 4（架构对比）：
+ 基于前面的分析结果，对比 PCG 和 BCG 的架构差异，输出：
+ 1. 对比表格（分段策略、编译方式、内存管理、动态形状、适用阶段）
+ 2. 两者是否互补，能否共存
+ 3. NPU 适配的关键瓶颈和可能的解决方案
+
+ 场景 C：最简触发（日常快速使用）
+
+ 帮我深入分析 sglang 中 PCG 和 BCG 的实现差异，
+ 以及华为 Ascend NPU 能否适配。请搜索相关代码和最新资料。
+
+ 关键词 "深入分析" + "搜索" 会自动触发 Explore agent 和 exa-search skill。
+
+ 关键触发词速查表
+
+ ┌───────────────────────┬──────────────────────────────────────────┐
+ │       想触发的        │             在 Prompt 中加入             │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ deep-research         │ /deep-research 或 "深度研究/research"    │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ codebase-onboarding   │ /codebase-onboarding 或 "帮我理解代码库" │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ exa-search            │ /exa-search 或 "搜索最新/查找资料"       │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ Explore agent         │ "探索代码"/"搜索实现"/"/explore"         │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ architect agent       │ "架构对比"/"设计分析"                    │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ python-reviewer agent │ "审查代码"/"review 代码质量"             │
+ ├───────────────────────┼──────────────────────────────────────────┤
+ │ docs-lookup           │ "怎么用"/"API 文档"/"library 用法"       │
+ └───────────────────────┴──────────────────────────────────────────┘
+
+ 验证方法
+
+ 用优化后的 prompt 开一个新 session，观察：
+ 1. Skill 工具是否被调用（主动触发的 skills）
+ 2. Agent 工具是否被调用，且 subagent_type 正确
+ 3. 回答质量是否比原 prompt 更全面、更有条理
