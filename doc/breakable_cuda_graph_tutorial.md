@@ -488,6 +488,280 @@ sequenceDiagram
     C->>C: _end_current_segment()
     C->>G: _segments[1].capture_end()
 ```
+我按时间顺序逐行解释，每一步对应哪行代码、发生了什么。
+
+---
+
+### 第1步：进入 with 块
+
+```
+F->>C: 进入 with 块 (__enter__)
+```
+
+对应代码 `breakable_cuda_graph_runner.py` 第347行：
+
+```python
+with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
+    output = run_once()
+```
+
+进入 `with` 时，Python 自动调用 `BreakableCUDAGraphCapture.__enter__`：
+
+```python
+def __enter__(self):
+    _install_wait_stream_hook()                         # 钩住 stream.wait_stream
+    self._capture_token = _current_capture_var.set(self) # 标记"我正在捕获"
+    self._stream_token = _current_stream_var.set(stream) # 记录使用的 stream
+    self._forked_token = _forked_streams_var.set(set())  # 初始化 forked stream 集合
+    self._begin_new_segment()                            # 开始第一个 segment
+    return self
+```
+
+---
+
+### 第2步：开始第一个 segment
+
+```
+C->>C: _begin_new_segment()
+C->>G: _segments.append(graph_0)
+```
+
+```python
+def _begin_new_segment(self) -> None:
+    graph = torch.cuda.CUDAGraph()       # 创建一个新的空 CUDAGraph 对象
+    graph.capture_begin(                 # 告诉 CUDA：从现在开始录制
+        pool=self._pool,
+        capture_error_mode=self._capture_error_mode
+    )
+    self.cuda_graph._segments.append(graph)  # 放入 segments 列表
+```
+
+**此时状态**：
+
+```
+G._segments = [graph_0]    (graph_0 正在捕获中)
+G._break_fns = []
+```
+
+CUDA Runtime 的 `capture_begin` 把当前 stream 切换到"捕获模式"。之后在这个 stream 上提交的所有 GPU kernel 都不会被立即执行，而是被录制到 `graph_0` 中。
+
+---
+
+### 第3步：执行层，被录制
+
+```
+F->>F: 执行 layer1, layer2... (被 CUDA Graph 捕获)
+```
+
+```python
+output = run_once()   # 实际上就是 model.forward(...)
+```
+
+model 的 forward 逐层执行，比如：
+
+```python
+# 伪代码：模型 forward
+x = self.embed(input_ids)        # 被录制到 graph_0
+x = self.layer1(x)               # 被录制到 graph_0
+x = self.layer2(x)               # 被录制到 graph_0
+x = self.attn(x)                 # ← 这个函数被 @eager_on_graph(True) 装饰了！
+```
+
+前三个操作都在捕获模式中，所以它们的 kernel launch 被录制到了 `graph_0`。
+
+---
+
+### 第4步：碰到被 `@eager_on_graph` 装饰的函数
+
+```
+F->>W: 调用 @eager_on_graph 装饰的函数
+W->>W: capture = _current_capture_var.get()
+```
+
+当 `self.attn(x)` 被调用时，因为 `attn` 被 `@eager_on_graph(True)` 装饰了，实际执行的是 `wrapper(x)`：
+
+```python
+def wrapper(*args, **kwargs):           # args = (x,), kwargs = {}
+    capture = _current_capture_var.get()  # 拿到 __enter__ 中 set 的 BreakableCUDAGraphCapture
+    if capture is None:                 # 不是 None，因为我们正在 with 块内
+        return inner(*args, **kwargs)   # ← 不走这条路
+```
+
+`capture` 不是 `None`，说明我们正处于 CUDA Graph 捕获中。接下来进入 graph break 逻辑。
+
+---
+
+### 第5步：结束当前 segment
+
+```
+W->>C: capture._end_current_segment()
+C->>G: _segments[0].capture_end()
+```
+
+```python
+# wrapper 内部调用
+capture._end_current_segment()
+```
+
+```python
+def _end_current_segment(self) -> None:
+    # 先 join 所有被 fork 的辅助 stream（如果有）
+    main_stream = get_current_stream()
+    forked = _forked_streams_var.get()
+    if forked:
+        for side in list(forked):
+            if _is_capturing(side.cuda_stream):
+                _original_wait_stream(main_stream, side)
+        forked.clear()
+    # 结束 graph_0 的捕获
+    self.cuda_graph._segments[-1].capture_end()   # graph_0.capture_end()
+```
+
+**此时状态**：
+
+```
+G._segments = [graph_0]    (graph_0 已捕获完毕，包含了 embed + layer1 + layer2)
+G._break_fns = []
+```
+
+调用 `capture_end()` 后，stream 退出捕获模式，回到正常模式。
+
+---
+
+### 第6步：eager 执行被装饰的函数
+
+```
+W->>W: output = inner(*args, **kwargs)  [eager 执行]
+```
+
+```python
+output = inner(*args, **kwargs)   # inner 就是原始的 attn 函数
+```
+
+此时 stream **不在捕获模式**，所以 `inner()` 的所有 GPU 操作都是**立即执行**的（eager）。
+
+`output` 是函数的返回值，它是一个正常的 GPU tensor，分配在 CUDA Graph 的共享内存池中。
+
+---
+
+### 第7步：创建 replay 闭包
+
+```
+W->>W: 创建 replay_fn 闭包
+```
+
+```python
+captured_inner = inner
+captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
+captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
+captured_output = _weak_ref_if_tensor(output)
+
+def replay_fn():
+    new_out = captured_inner(*captured_args, **captured_kwargs)
+    return _copy_output(captured_output, new_out)
+```
+
+闭包捕获了四个变量。这个闭包的作用是：**replay 时重新执行这个函数，把新输出写回原来的地址**。
+
+---
+
+### 第8步：存储闭包，开始新 segment
+
+```
+W->>G: _break_fns.append(replay_fn)
+W->>C: capture._begin_new_segment()
+C->>G: _segments.append(graph_1)
+```
+
+```python
+capture.cuda_graph._break_fns.append(replay_fn)  # 存储闭包
+capture._begin_new_segment()                       # 开始新的 segment
+```
+
+`_begin_new_segment()` 和第2步完全相同：创建新的 `torch.cuda.CUDAGraph`，调用 `capture_begin`。
+
+**此时状态**：
+
+```
+G._segments = [graph_0, graph_1]   (graph_0 完整，graph_1 正在捕获)
+G._break_fns = [replay_fn]
+```
+
+---
+
+### 第9步：继续执行后续层
+
+```
+F->>F: 继续执行 layer3, layer4... (被新 segment 捕获)
+```
+
+从 `attn` 返回后，forward 继续执行后续层。此时 stream 又在捕获模式中，这些操作被录制到 `graph_1`。
+
+```python
+x = self.attn(x)        # ← 已返回，break 处理完毕
+x = self.layer3(x)      # 被录制到 graph_1
+x = self.layer4(x)      # 被录制到 graph_1
+x = self.lm_head(x)     # 被录制到 graph_1
+return x
+```
+
+---
+
+### 第10步：退出 with 块
+
+```
+F->>C: 退出 with 块 (__exit__)
+C->>C: _end_current_segment()
+C->>G: _segments[1].capture_end()
+```
+
+`run_once()` 执行完毕，`with` 块结束，Python 调用 `__exit__`：
+
+```python
+def __exit__(self, *args):
+    try:
+        self._end_current_segment()   # 结束 graph_1 的捕获
+    finally:
+        _forked_streams_var.reset(self._forked_token)
+        _current_stream_var.reset(self._stream_token)
+        _current_capture_var.reset(self._capture_token)
+        _uninstall_wait_stream_hook()
+```
+
+**最终状态**：
+
+```
+G._segments = [graph_0, graph_1]    (两个都已捕获完毕)
+G._break_fns = [replay_fn]
+
+graph_0 包含: embed → layer1 → layer2 的 GPU kernel
+graph_1 包含: layer3 → layer4 → lm_head 的 GPU kernel
+
+replay_fn 包含: 重新执行 attn 并写回原地址的闭包
+```
+
+---
+
+### 完整的 Replay 就是对称的逆过程
+
+```python
+def replay(self) -> None:
+    for i, seg in enumerate(self._segments):
+        seg.replay()                        # 回放 graph_0 的 kernel
+        if i < len(self._break_fns):
+            self._break_fns[i]()            # 执行 replay_fn
+    # seg.replay()                          # 回放 graph_1 的 kernel
+```
+
+对应到上面的例子：
+
+```
+replay graph_0     → 执行 embed, layer1, layer2
+replay_fn()        → 重新计算 attn，写回 captured_output 地址
+replay graph_1     → 执行 layer3, layer4, lm_head（读 attn 的输出地址）
+```
+
+每个 `graph.replay()` 是一次 GPU 上的批量 kernel 启动，只有一个 CPU→GPU 的通信开销。中间的 `replay_fn()` 是 Python 层面的函数调用。
 
 ### 3.6 break_graph -- 手动断点
 
