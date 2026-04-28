@@ -29,12 +29,22 @@ from typing import Any, Callable
 
 import torch
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 try:
     from cuda.bindings import runtime as rt
 except ImportError:
     rt = None
 
 from sglang.srt.model_executor.breakable_cuda_graph.cuda_utils import checkCudaErrors
+
+if _is_npu:
+    from sglang.srt.model_executor.breakable_cuda_graph.npu_utils import (
+        capture_status_npu,
+        is_capturing_npu,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +85,17 @@ def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
     return stream
 
 
-def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
+def _capture_status(stream_ptr: int):
+    if _is_npu:
+        return capture_status_npu(stream_ptr)
     _check_cuda_bindings()
     status, *_ = checkCudaErrors(rt.cudaStreamGetCaptureInfo(stream_ptr))
     return status
 
 
 def _is_capturing(stream_ptr: int) -> bool:
+    if _is_npu:
+        return is_capturing_npu(stream_ptr)
     _check_cuda_bindings()
     return (
         _capture_status(stream_ptr)
@@ -114,10 +128,7 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
     is_other_cap = other is capturing or other.cuda_stream == cap_ptr
 
     if is_self_cap and not is_other_cap:
-        if (
-            _capture_status(other.cuda_stream)
-            != rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
-        ):
+        if not _is_capturing(other.cuda_stream):
             return
         _original_wait_stream(self, other)
         forked.discard(other)
