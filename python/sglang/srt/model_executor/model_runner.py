@@ -2835,7 +2835,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.enable_breakable_cuda_graph:
             # Experimental feature
-            self.piecewise_cuda_graph_runner = BreakableCudaGraphRunner(self)
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.graph_runner.breakable_npu_graph_runner import (
+                    BreakableNpuGraphRunner,
+                )
+
+                self.piecewise_cuda_graph_runner = BreakableNpuGraphRunner(self)
+            else:
+                self.piecewise_cuda_graph_runner = BreakableCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 

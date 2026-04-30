@@ -114,10 +114,7 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
     is_other_cap = other is capturing or other.cuda_stream == cap_ptr
 
     if is_self_cap and not is_other_cap:
-        if (
-            _capture_status(other.cuda_stream)
-            != rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
-        ):
+        if not _is_capturing(other.cuda_stream):
             return
         _original_wait_stream(self, other)
         forked.discard(other)
