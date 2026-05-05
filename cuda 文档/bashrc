@@ -1,0 +1,9 @@
+alias ccd='claude --dangerously-skip-permissions'
+# Daily development
+alias claude-dev='claude --system-prompt "$(cat ~/.claude/plugins/cache/everything-claude-code/everything-claude-code/2.0.0-rc.1/contexts/dev.md)"'
+
+# PR review mode
+alias claude-review='ccd --system-prompt "$(cat ~/.claude/plugins/cache/everything-claude-code/everything-claude-code/2.0.0-rc.1/contexts/review.md)"'
+
+# Research/exploration mode
+alias claude-research='ccd --system-prompt "$(cat ~/.claude/plugins/cache/everything-claude-code/everything-claude-code/2.0.0-rc.1/contexts/research.md)"'
