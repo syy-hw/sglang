@@ -18,6 +18,186 @@
 
 ---
 
+## Gemma 4 模型架构概述
+
+> 本章节为理解后续 SWA 内容提供模型架构上下文。
+> 数据来源：HuggingFace config.json、Google 官方博客、sglang 代码库。
+
+### 1. 模型变体总览
+
+Gemma 4 于 2026 年 4 月发布（Apache 2.0 许可），包含 **四种模型变体**、**三种不同架构**：
+
+| 变体 | 架构类型 | 总参数量 | 活跃参数量 | 层数 | 上下文长度 | 模态 | 滑动窗口大小 |
+|------|---------|---------|-----------|------|-----------|------|------------|
+| **E2B** | Dense + PLE | 5.1B | 2.3B | 35 | 128K | Text, Image, Audio | 512 |
+| **E4B** | Dense + PLE | 8B | 4.5B | 42 | 128K | Text, Image, Audio | 512 |
+| **26B A4B** | MoE | 25.2B | 3.8B | 30 | 256K | Text, Image | 1024 |
+| **31B** | Dense | 30.7B | 30.7B | 60 | 256K | Text, Image | 1024 |
+
+> PLE = Per-Layer Embedding（每层嵌入），使总参数量大于有效参数量。
+
+### 2. Transformer 解码器详细参数
+
+| 参数 | E2B | E4B | 26B A4B (MoE) | 31B (Dense) |
+|------|-----|-----|---------------|-------------|
+| `hidden_size` | 1536 | 2560 | 2816 | 5376 |
+| `num_hidden_layers` | 35 | 42 | 30 | 60 |
+| `num_attention_heads` | 8 | 8 | 16 | 32 |
+| `num_key_value_heads`（SWA 层） | 1 | 2 | 8 | 16 |
+| `num_global_key_value_heads`（Full 层） | 1 (=kv) | 2 (=kv) | 2 | 4 |
+| `head_dim`（SWA 层） | 256 | 256 | 256 | 256 |
+| `global_head_dim`（Full 层） | 512 | 512 | 512 | 512 |
+| `intermediate_size` | 6144 | 10240 | 2112 | 21504 |
+| `moe_intermediate_size` | — | — | 704 | — |
+| `vocab_size` | 262144 | 262144 | 262144 | 262144 |
+| `rms_norm_eps` | 1e-6 | 1e-6 | 1e-6 | 1e-6 |
+| `final_logit_softcapping` | 30.0 | 30.0 | 30.0 | 30.0 |
+| `hidden_activation` | gelu_pytorch_tanh | gelu_pytorch_tanh | gelu_pytorch_tanh | gelu_pytorch_tanh |
+
+### 3. 整体架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Gemma 4 Transformer Decoder                      │
+│                                                                     │
+│  Input Tokens ──► Token Embedding (262K vocab)                      │
+│                    + Per-Layer Embedding (PLE, E2B/E4B only)        │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  Decoder Layer × N (交替 SWA / Full Attention)              │    │
+│  │                                                             │    │
+│  │  ┌───────────────────────────────────────────────────────┐  │    │
+│  │  │  Attention Block                                      │  │    │
+│  │  │                                                       │  │    │
+│  │  │  SWA 层 (每 6 层中 5 层):                              │  │    │
+│  │  │    head_dim=256, KV heads=N/16                        │  │    │
+│  │  │    sliding_window=512(E2B/E4B)/1024(26B/31B)          │  │    │
+│  │  │    RoPE: theta=10000, full rotation                   │  │    │
+│  │  │    + Attention Sinks (可学习偏置)                      │  │    │
+│  │  │                                                       │  │    │
+│  │  │  Full 层 (每 6 层中 1 层 + 最后一层):                   │  │    │
+│  │  │    global_head_dim=512, global_KV_heads=N/16          │  │    │
+│  │  │    无窗口限制 (全局注意力)                              │  │    │
+│  │  │    p-RoPE: theta=1M, partial_rotary_factor=0.25       │  │    │
+│  │  │    K=V 权重共享 (26B/31B)                              │  │    │
+│  │  └───────────────────────────────────────────────────────┘  │    │
+│  │                          │                                  │    │
+│  │                          ▼                                  │    │
+│  │  ┌───────────────────────────────────────────────────────┐  │    │
+│  │  │  FFN / MoE Block                                      │  │    │
+│  │  │                                                       │  │    │
+│  │  │  Dense 变体 (E2B/E4B/31B):                            │  │    │
+│  │  │    标准 MLP (GELU tanh)                                │  │    │
+│  │  │    E2B: use_double_wide_mlp (中间层 2x)                │  │    │
+│  │  │                                                       │  │    │
+│  │  │  MoE 变体 (26B A4B only):                             │  │    │
+│  │  │    128 路由专家 + 1 共享专家                            │  │    │
+│  │  │    top-k=8 (每 token 激活 8 个专家)                    │  │    │
+│  │  │    expert intermediate_size=704                        │  │    │
+│  │  │    稀疏度 ~85.4%                                       │  │    │
+│  │  └───────────────────────────────────────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+│  ──► RMSNorm ──► Final Logit Softcapping (30.0) ──► Output          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 4. 混合注意力机制详解
+
+Gemma 4 的核心创新是 **双几何注意力（Dual-Geometry Attention）**：
+
+```
+Layer:  0    1    2    3    4    5    6    7    8    9   10   11   ...
+Type:  SWA  SWA  SWA  SWA  SWA Full  SWA  SWA  SWA  SWA  SWA Full  ...
+       ├─────── 5:1 交替 ───────┤    ├─────── 5:1 交替 ───────┤
+
+最后一层始终为 Full Attention。
+```
+
+| 特性 | SWA 层（滑动窗口） | Full 层（全局注意力） |
+|------|-------------------|---------------------|
+| 出现频率 | 每 6 层中 5 层 | 每 6 层中 1 层 + 最后一层 |
+| `head_dim` | 256 | 512 |
+| KV heads | `num_key_value_heads` | `num_global_key_value_heads`（更少） |
+| RoPE | 标准, theta=10000, 全维度旋转 | p-RoPE, theta=1000000, 仅旋转 25% 维度 |
+| 窗口限制 | 512 (E2B/E4B) / 1024 (26B/31B) | 无限制（全局） |
+| Attention Sinks | ✅（可学习标量偏置） | ❌ |
+| K=V 共享 | ❌ | ✅（26B/31B 变体） |
+
+### 5. MoE 架构（仅 26B A4B）
+
+```
+                    Input Token
+                        │
+                        ▼
+              ┌─────────────────┐
+              │  Gemma4Router   │
+              │  (softmax 路由)  │
+              └────────┬────────┘
+                       │
+         ┌─────────────┼─────────────┐
+         │             │             │
+         ▼             ▼             ▼
+   ┌──────────┐  ┌──────────┐  ┌──────────┐
+   │ Expert 0 │  │ Expert 1 │  │Expert 127│  × 128 路由专家
+   │ MLP(704) │  │ MLP(704) │  │ MLP(704) │  每个: intermediate=704
+   └────┬─────┘  └────┬─────┘  └────┬─────┘
+        │              │              │
+        └──────selected top-8────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │  Shared Expert  │  × 1 共享专家（始终激活）
+              │  MLP(704)       │
+              └────────┬────────┘
+                       │
+                       ▼
+                Weighted Sum
+                       │
+                       ▼
+                  FFN Output
+```
+
+- **路由专家**：128 个，每个 `moe_intermediate_size=704`
+- **共享专家**：1 个，始终激活
+- **top-k 路由**：每 token 选择 8 个专家
+- **稀疏度**：~85.4%（仅 14.6% 参数活跃）
+- 代码实现：`gemma4_causal.py` 第 104-189 行，包含 `Gemma4Router` 和专家缩放
+
+### 6. 与 Gemma 3 的架构差异
+
+| 特性 | Gemma 3 | Gemma 4 |
+|------|---------|---------|
+| 模型变体 | 1B, 4B, 12B, 27B | E2B, E4B, 26B A4B, 31B |
+| 架构类型 | 全部 Dense | Dense + MoE 混合 |
+| `head_dim` | 统一 128 | 双几何：SWA=256, Full=512 |
+| 全局层 RoPE | 线性缩放 8x | p-RoPE（仅旋转 25% 维度） |
+| K=V 权重共享 | 无 | 全局层启用（26B/31B） |
+| MoE | 无 | 128 experts, top-k=8（26B A4B） |
+| 每层嵌入（PLE） | 无 | E2B/E4B 专有 |
+| KV 共享层 | 无 | E2B=20 层, E4B=18 层 |
+| Vocab 大小 | 256K | 262K |
+| 许可证 | Gemma 使用条款 | Apache 2.0 |
+| SWA 窗口 | 512/4096/8192 | 512 (小模型) / 1024 (大模型) |
+
+### 7. 代码库关键文件
+
+| 文件 | 内容 | 行号 |
+|------|------|------|
+| `models/gemma4_causal.py` | 模型主实现，包含注意力、MoE、PLE | 全文 |
+| `models/gemma4_causal.py:104-189` | `Gemma4Router` + MoE 路由逻辑 | 104-189 |
+| `models/gemma4_causal.py:221-232` | 混合注意力层定义（`layer_types`, `sliding_window`） | 221-232 |
+| `models/gemma4_causal.py:394-463` | PLE 机制（门控 + 投影） | 394-463 |
+| `models/gemma4_causal.py:422-426` | 双宽 MLP 支持 | 422-426 |
+| `models/gemma4_causal.py:474` | `enable_moe_block` MoE 开关 | 474 |
+| `configs/model_config.py` | SWA 检测、层 ID 分配、窗口大小解析 | 431-441, 989-994 |
+
+### 8. SWA 在整体架构中的位置
+
+> **过渡说明**：以上架构概述表明，Gemma 4 的 SWA 是其 **双几何注意力** 设计的核心组成部分。SWA 层占全部 Transformer 层的 5/6，负责高效捕获局部上下文；Full 层占 1/6，负责全局信息传递。两者共享同一套 KV 缓存基础设施（`SWAKVPool` 双池架构），但具有不同的头维度、KV 头数和 RoPE 配置。理解这一架构背景后，以下章节将详细分析 SWA 在 GPU 和 NPU 上的具体实现。
+
+---
+
 ## 1. 背景与问题
 
 为 Ascend NPU A3 适配 Gemma 4 系列模型的 Sliding Window Attention (SWA)。已知问题：同事 POC 版本单次 curl 正常，长跑精度异常（零点几），疑似 SWA 逻辑问题。
@@ -57,9 +237,7 @@
 
 #### 关键概念：`paged_kernel_lens`
 
-`paged_kernel_lens` 是传给 FlashInfer 分页注意力内核的参数，表示**每个请求在本次注意力计算中实际需要关注的 KV cache 有效长度**。
-
-内核不会读取整个 KV cache，而是根据 `paged_kernel_lens` 和 `kv_start_idx` 只访问窗口范围内的 KV 条目：
+`paged_kernel_lens` 和 `kv_start_idx` 是 FlashInfer `call_begin_forward` API 的参数（`flashinfer_backend.py:1106-1109`）。两者配合定义内核实际访问的 KV cache 范围：
 
 ```
 KV Cache:  [token_0, token_1, ..., token_N-1]
@@ -67,21 +245,26 @@ KV Cache:  [token_0, token_1, ..., token_N-1]
               <--- paged_kernel_lens --->
 ```
 
-**Decode 路径**（`flashinfer_backend.py` 第 1036-1037 行）：
+**Decode 路径**（`flashinfer_backend.py:1031-1041`）：
 ```python
-# wrapper_id == 0: SWA 层
-paged_kernel_lens_tmp = torch.clamp(seq_lens, max=self.sliding_window_size + 1)
+# Sliding window attention
+paged_kernel_lens_tmp = torch.clamp(
+    seq_lens, max=self.sliding_window_size + 1
+)
 kv_start_idx_tmp = seq_lens - paged_kernel_lens_tmp
 ```
 
-- `seq_lens` = 当前序列总长度（含刚写入的 token）
-- 例：序列长度 10000，窗口 4096 → `paged_kernel_lens = min(10000, 4097) = 4097`，`kv_start_idx = 10000 - 4097 = 5903`
-- 内核只访问 KV cache 的 `[5903, 10000)` 范围，而非全部 10000 个 token
-- **为什么 +1**：decode 生成了 1 个新 token，窗口应包含它，所以窗口大小 = `sliding_window_size + 1`
-
-**Prefill 路径**（`flashinfer_backend.py` 第 1320-1322 行）：
+其中 `seq_lens` 来源于 `schedule_batch.py:1678`：
 ```python
-# wrapper_id == 0: SWA 层
+seq_lens = [len(r.fill_ids) for r in reqs]
+```
+
+- 例：序列长度 10000，窗口 4096 → `paged_kernel_lens = min(10000, 4097) = 4097`，`kv_start_idx = 10000 - 4097 = 5903`
+- **关于 +1**：代码中无 inline comment。从行为推断——decode 步骤中 `seq_lens` 已包含刚生成的 1 个新 token，而 `sliding_window_size` 是模型 config 定义的窗口大小，`+1` 使内核访问范围覆盖当前新 token
+
+**Prefill 路径**（`flashinfer_backend.py:1315-1325`）：
+```python
+# window attention use paged only
 paged_kernel_lens = torch.minimum(
     seq_lens,
     torch.tensor(self.sliding_window_size) + seq_lens - prefix_lens,
@@ -89,27 +272,101 @@ paged_kernel_lens = torch.minimum(
 kv_start_idx = seq_lens - paged_kernel_lens
 ```
 
-- `seq_lens - prefix_lens` = 本次 extend 新增的 token 数
-- `sliding_window_size + (seq_lens - prefix_lens)` = 窗口 + 新 token 数，确保窗口覆盖新 token 可见的全部历史 token
-- `min(seq_lens, ...)` 确保不超过实际序列长度（序列短于窗口时不截断）
+- `seq_lens - prefix_lens`：由 `schedule_batch.py:1747` 的 assertion 确认等于 `req.extend_input_len`（本次 extend 新增 token 数）：
+  ```python
+  # schedule_batch.py:1678, 1680 — seq_lens 和 prefix_lens 的来源
+  seq_lens = [len(r.fill_ids) for r in reqs]          # fill_ids 总长度
+  prefix_lens = [len(r.prefix_indices) for r in reqs]  # radix tree 已缓存的前缀 token 数
+
+  # schedule_batch.py:1747 — assertion 确认差值 = extend_input_len
+  assert seq_len - pre_len == req.extend_input_len
+  ```
+- `sliding_window_size + (seq_lens - prefix_lens)`：代码中无 inline comment。从行为推断——prefill 中新增的每个 query token 需要看到窗口内的历史 token 加上本次 extend 的所有新 token，因此 `paged_kernel_lens` 上限 = 窗口大小 + 新增 token 数
+- `min(seq_lens, ...)`：当总序列长度短于窗口时，不截断
+
+**为什么需要 `paged_kernel_lens` 和 `kv_start_idx`？**
+
+FlashInfer 分页注意力内核默认会访问**整个 KV cache**。对 Full 层这没问题，但 SWA 层只应看到窗口内的 token——如果不限制，SWA 层就变成了 Full 层，失去了滑动窗口节省计算的意义。`paged_kernel_lens` 和 `kv_start_idx` 就是告诉内核"从哪个位置开始看，看多少个"。
+
+```
+=== Decode 场景 ===
+Gemma 4 31B, sliding_window_size=1024, 正在 decode 第 5000 个 token
+
+seq_lens = 5000 (已包含刚生成的 token)
+
+如果不限制，内核访问 KV cache 的 [0, 5000) → 5000 个 token，与 Full 层无异
+实际限制：
+  paged_kernel_lens = min(5000, 1024+1) = 1025
+  kv_start_idx       = 5000 - 1025      = 3975
+  内核只访问 [3975, 5000) → 1024 个历史 + 1 个当前 = 1025 个 token
+
+  [0 .......... 3975 ................. 5000]
+                ↑ kv_start_idx           ↑ seq_lens
+                <---- 1025 tokens ------>
+                (paged_kernel_lens)
+
+=== Prefill 场景 ===
+同一个模型，prefill 一个 3000 token 的 prompt，radix tree 命中了 2000 token 前缀
+
+seq_lens     = 3000 (总长度)
+prefix_lens  = 2000 (已缓存前缀)
+新增 token   = seq_lens - prefix_lens = 1000
+
+sliding_window_size = 1024
+paged_kernel_lens = min(3000, 1024 + 1000) = min(3000, 2024) = 2024
+kv_start_idx      = 3000 - 2024            = 976
+
+为什么是 2024？
+  1024 (窗口大小)：新增 token 需要看到窗口内的历史 token
+  + 1000 (新增数)：新增 token 之间也需要互相看到 (causal mask)
+  = 2024 个 KV token 需要被访问
+
+  [0 ... 976 ......................... 3000]
+          ↑ kv_start_idx                 ↑ seq_lens
+          <------- 2024 tokens ---------->
+```
 
 #### 关键概念：`new_swa_evicted_seqlen`
 
-`new_swa_evicted_seqlen` 表示**SWA KV cache 中可以安全释放的 token 序列位置上限**。位置 `[0, new_swa_evicted_seqlen)` 范围内的 token 保证不在当前滑动窗口内，可以从 SWA 池中释放。
+`new_swa_evicted_seqlen` 是 `_evict_swa()` 函数中的局部变量（`schedule_batch.py:2682`），表示本次淘汰后 SWA KV cache 的释放边界。
 
-计算逻辑（`schedule_batch.py` 第 2682-2685 行）：
+`_evict_swa` 函数头有 inline comment 说明其目的（`schedule_batch.py:2664`）：
 ```python
+# For swa radix cache, we need to evict the tokens that are not in the
+# tree cache and also not in the sliding window
+```
+
+计算逻辑（`schedule_batch.py:2671-2684`）：
+```python
+# Subtract an extra page_size so the eviction frontier never reaches the
+# radix tree insert boundary (page_floor(seq_len)). This keeps at least one
+# page of non-evicted SWA KV for the tree to store as a non-tombstone node,
+# preserving cache reuse in multi-turn scenarios.
+# See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
 new_swa_evicted_seqlen = max(
     req.swa_evicted_seqlen,
     pre_len - sliding_window_size - self.tree_cache.page_size,
 )
+
+if self.tree_cache.page_size > 1:
+    new_swa_evicted_seqlen = (
+        new_swa_evicted_seqlen // self.tree_cache.page_size
+    ) * self.tree_cache.page_size
 ```
 
-各部分含义：
-- `pre_len`：当前序列长度（本次步骤之前）
-- `pre_len - sliding_window_size`：超出滑动窗口的最早位置。窗口从 `pre_len - sliding_window_size` 到 `pre_len`，此位置之前的 token 不在窗口内
-- 再减 `page_size`：安全裕量。确保至少保留一个非墓碑页面供基数树在多轮对话中复用（基数树需要非墓碑节点来合并前缀）
-- `max(old, ...)`：淘汰只向前推进，不会回退。避免释放已释放过的 slot
+各部分来源：
+
+- **`pre_len`**：`_evict_swa` 的参数，在不同调用路径中来源不同：
+  - Decode 路径（`schedule_batch.py:2644`）：`self._evict_swa(req, req.seqlen - 1)`，传入 `req.seqlen - 1`
+  - Extend 路径（`schedule_batch.py:2646`）：`self._evict_swa(req, pre_len)`，其中 `pre_len = self.prefix_lens[idx]`，即 radix tree 已缓存的前缀长度（`schedule_batch.py:1680`：`prefix_lens = [len(r.prefix_indices) for r in reqs]`）
+
+- **`pre_len - sliding_window_size`**：代码中无 inline comment。从表达式推断——窗口覆盖范围是 `[pre_len - sliding_window_size, pre_len)`，此位置之前的 token 不在窗口内
+
+- **再减 `page_size`**：代码 inline comment 原文——*"Subtract an extra page_size so the eviction frontier never reaches the radix tree insert boundary (page_floor(seq_len)). This keeps at least one page of non-evicted SWA KV for the tree to store as a non-tombstone node, preserving cache reuse in multi-turn scenarios."* 另见 `swa_radix_cache.py` 中 `_insert_helper case 3`（defensive counterpart）
+
+- **`max(req.swa_evicted_seqlen, ...)`**：`req.swa_evicted_seqlen` 初始值为 0（`schedule_batch.py:746`：`self.swa_evicted_seqlen = 0`），每次淘汰后更新为 `new_swa_evicted_seqlen`（`schedule_batch.py:2691`：`req.swa_evicted_seqlen = new_swa_evicted_seqlen`）。`max` 保证淘汰边界只向前推进
+
+- **页对齐**（`schedule_batch.py:2681-2684`）：当 `page_size > 1` 时，`new_swa_evicted_seqlen` 向下对齐到 `page_size` 的整数倍
 
 示例（窗口 4096，page_size 16，pre_len 8000）：
 ```
@@ -120,11 +377,89 @@ new_swa_evicted_seqlen = max(
 [3888, 8000) 范围的 SWA KV cache 必须保留（在窗口内）
 ```
 
+**为什么需要淘汰？为什么必须减 `page_size`？**
+
+```
+=== 为什么需要 SWA KV 淘汰？ ===
+
+SWA pool 的容量是有限的（比 full pool 小得多）。
+如果只写入不释放，decode 到第 10000 个 token 时 SWA pool 仍有 10000 条 KV，
+SWA pool 会溢出。淘汰就是把"窗口已经滑过去"的 KV 从 SWA pool 中释放，
+回收 slot 给新 token 使用。
+
+=== 为什么必须减 page_size？不减会怎样？ ===
+
+场景：sliding_window_size=4096, page_size=16, seq_len=8000
+  radix tree 的 insert boundary = page_floor(8000) = 8000 // 16 * 16 = 8000
+
+如果不算 page_size：
+  eviction frontier = 8000 - 4096 = 3904
+  释放 [0, 3904) 的 SWA KV → 看起来没问题
+
+但如果 seq_len 继续增长到 8016（刚好一个 page 边界）：
+  radix tree insert boundary = 8016
+  上次 eviction frontier = 8016 - 4096 = 3920
+
+问题在多轮对话中暴露：
+  第一轮：用户发 8000 token → radix tree 缓存了前缀
+  第二轮：用户追加 prompt → radix tree 尝试复用第一轮的缓存前缀
+          → 但前缀对应的 SWA KV 已经被淘汰了！
+          → 节点变成"墓碑"（SWA KV 已释放，full KV 仍在）
+          → 无法复用缓存，必须重新计算 → 性能退化
+
+减一个 page_size 留出安全裕量：
+  → radix tree 至少能保留一页非墓碑 SWA KV
+  → 多轮对话中第二轮可以复用第一轮的缓存前缀
+  → 这就是代码 comment 中 "preserving cache reuse in multi-turn scenarios" 的含义
+```
+
 #### Sink Token
 
-Sink token 是**可学习的、每头的标量偏置**，添加到注意力 softmax 中，补偿滑动窗口导致的被淘汰 KV 缓存条目。并非每个 SWA 模型都使用——由 `ModelConfig.has_attention_sinks` 控制。
+Sink token 的启用由 `ModelConfig.has_attention_sinks` 控制（`model_config.py:444`）：
+```python
+self.has_attention_sinks = self._detect_attention_sinks()
+```
 
-**关键**：Sink token **不**存储在 KV 缓存中。它们是 FlashInfer/TensorRT-LLM 注意力内核应用于 softmax 计算的标量值。KV 缓存完全不知道 sink。
+在注意力层中，sinks 作为可选参数传递（`radix_attention.py:161`）：
+```python
+sinks: Optional[torch.Tensor] = None,
+```
+当 `sinks is not None` 时，通过 kwargs 传入注意力内核（`radix_attention.py:178`）：
+```python
+if sinks is not None:
+    kwargs["sinks"] = sinks
+```
+
+代码中无 inline comment 解释 sinks 的语义。从参数传递链和模型实现推断——sinks 是每头、每 token 的可学习标量，在 softmax 计算中作为偏置项，补偿因 SWA 淘汰导致的注意力分数偏移。sinks **不**存储在 KV 缓存中，是注意力内核在 softmax 阶段应用的标量值。
+
+**为什么需要 Sink Token？**
+
+```
+场景：Gemma 4 31B, sliding_window_size=1024, 序列长度 5000
+
+=== 没有 sink token 时 ===
+  SWA 层只能看到 token [3976, 5000)
+  token [0, 3976) 的 KV 被 attention 完全忽略
+  softmax 分母只包含窗口内 token 的 exp(score) 之和
+  → 分母变小，注意力分布偏移
+  → 模型丢失了"全局上下文"信号，长序列输出质量下降
+
+=== 有 sink token 时 ===
+  每个 attention head 有一个可学习的标量 s (一个 float)
+  softmax 计算变为：
+    attention_weights = softmax(scores + s)
+  → exp(s) 补偿了被淘汰 token 的贡献
+  → 即使 SWA 只看窗口内 token，注意力分布仍然平衡
+
+  sink 是标量（不是 KV），不占用 KV cache 空间
+  → 内存开销极小：每层 × 每头 × 1 个 float
+
+=== 为什么不是所有 SWA 模型都用？ ===
+  从 _detect_attention_sinks() 代码（model_config.py:453-470）可知：
+  - GptOss: 总是使用 sinks
+  - MiMoV2: 仅当 config 中 add_swa_attention_sink_bias=True 时使用
+  - Gemma4: 该函数返回 False → Gemma4 不使用 sinks
+```
 
 ### 2.2 初始化阶段
 
@@ -132,41 +467,85 @@ Sink token 是**可学习的、每头的标量偏置**，添加到注意力 soft
 
 ##### `ModelConfig`（`configs/model_config.py`）
 
-| 字段 | 含义 |
-|------|------|
-| `is_hybrid_swa` | 布尔值，标识当前模型是否为混合 SWA 架构。通过 `is_hybrid_swa_model()` 检查 `hf_config.architectures` 是否包含已知 SWA 架构（Llama4, GptOss, MiMoV2, Step3.5, Gemma4） |
-| `sliding_window_size` | 滑动窗口大小（token 数）。从 HF config 读取，优先级：`sliding_window_size` > `sliding_window` > `window_size` |
-| `swa_attention_layer_ids` | 列表，哪些层使用滑动窗口注意力。例如 Gemma4 每隔 N 层交替 SWA/Full |
-| `full_attention_layer_ids` | 列表，哪些层使用全局注意力（无窗口限制） |
-| `has_attention_sinks` | 布尔值，标识模型是否使用可学习的 attention sink 偏置参数 |
+| 字段 | 代码来源 |
+|------|---------|
+| `is_hybrid_swa` | `model_config.py:431-434`：`is_hybrid_swa_model(architectures) and not disable_hybrid_swa`。`is_hybrid_swa_model()`（`:1567-1579`）检查架构是否在 `hybrid_swa_archs` 集合中 |
+| `sliding_window_size` | `model_config.py:989-994`：`_get_sliding_window_size()` 按优先级读取 `hf_text_config` 的 `sliding_window_size`、`sliding_window`、`window_size` |
+| `swa_attention_layer_ids` | `model_config.py:1582-1642`：`get_hybrid_layer_ids()` 返回值。Gemma4 从 `hf_text_config.layer_types` 筛选 `"sliding_attention"` |
+| `full_attention_layer_ids` | 同上。Gemma4 从 `layer_types` 筛选 `"full_attention"` |
+| `has_attention_sinks` | `model_config.py:453-470`：`_detect_attention_sinks()` 返回值。函数 docstring 原文：*"Attention sinks are per-head scalars added to the softmax denominator to compensate for evicted KV-cache entries under sliding-window attention. Not every hybrid-SWA model uses them."* |
 
 ```python
-# model_config.py 第 431-434 行
+# model_config.py:431-434
 self.is_hybrid_swa = (
     is_hybrid_swa_model(self.hf_config.architectures)
     and not self.disable_hybrid_swa
 )
 
-# model_config.py 第 989-994 行
+# model_config.py:1567-1579
+def is_hybrid_swa_model(model_architectures: List[str]):
+    hybrid_swa_archs = {
+        "Llama4ForConditionalGeneration",
+        "GptOssForCausalLM",
+        *MIMO_V2_MODEL_ARCHS,
+        "MiMoV2MTP",
+        "Step3p5ForCausalLM",
+        "Step3p5MTP",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+    }
+    return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+# model_config.py:989-994
 def _get_sliding_window_size(self) -> Optional[int]:
     for key in ("sliding_window_size", "sliding_window", "window_size"):
         value = getattr(self.hf_text_config, key, None)
         if value is not None:
             return value
     return None
+
+# model_config.py:1582-1600 (Gemma4 分支)
+elif (
+    "Gemma4ForCausalLM" in model_architectures
+    or "Gemma4ForConditionalGeneration" in model_architectures
+):
+    layer_types = getattr(hf_text_config, "layer_types", [])
+    swa_attention_layer_ids = [
+        i for i, x in enumerate(layer_types) if x == "sliding_attention"
+    ]
+    full_attention_layer_ids = [
+        i for i, x in enumerate(layer_types) if x == "full_attention"
+    ]
+
+# model_config.py:453-470
+def _detect_attention_sinks(self) -> bool:
+    """Check whether the model uses learned attention sinks.
+
+    Attention sinks are per-head scalars added to the softmax denominator
+    to compensate for evicted KV-cache entries under sliding-window
+    attention.  Not every hybrid-SWA model uses them.
+    """
+    archs = self.hf_config.architectures or []
+    if "GptOssForCausalLM" in archs:
+        return True
+    if any(a in archs for a in (*MIMO_V2_MODEL_ARCHS, "MiMoV2MTP")):
+        return getattr(
+            self.hf_text_config, "add_swa_attention_sink_bias", False
+        ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
+    return False
 ```
 
 ##### `ModelRunner`（`model_executor/model_runner.py`）
 
-| 字段 | 含义 |
-|------|------|
-| `is_hybrid_swa` | 从 ModelConfig 透传，供 attention backend 和 memory pool 判断 |
-| `sliding_window_size` | 最终解析的窗口大小。优先级：模型方法 > config > attention_chunk_size |
-| `full_max_total_num_tokens` | full KV pool 最大 token 容量 |
-| `swa_max_total_num_tokens` | SWA KV pool 最大 token 容量 |
+| 字段 | 代码来源 |
+|------|---------|
+| `is_hybrid_swa` | `model_runner.py`：直接赋值 `model_config.is_hybrid_swa`，供 attention backend 和 memory pool 使用 |
+| `sliding_window_size` | `model_runner.py:1495-1508`：三级优先级解析——`model.get_attention_sliding_window_size()` > `model_config.sliding_window_size` > `model_config.attention_chunk_size` |
+| `full_max_total_num_tokens` | `model_runner_kv_cache_mixin.py:725`：`self.full_max_total_num_tokens = config.full_max_total_num_tokens`。代码中无 inline comment。从参数名推断：full KV pool 的最大 token 容量 |
+| `swa_max_total_num_tokens` | `model_runner_kv_cache_mixin.py:726`：`self.swa_max_total_num_tokens = config.swa_max_total_num_tokens`。代码中无 inline comment。从参数名推断：SWA KV pool 的最大 token 容量 |
 
 ```python
-# model_runner.py 第 1495-1508 行
+# model_runner.py:1495-1508
 self.sliding_window_size = None
 if hasattr(self.model, "get_attention_sliding_window_size"):
     self.sliding_window_size = self.model.get_attention_sliding_window_size()
@@ -181,79 +560,153 @@ elif self.model_config.attention_chunk_size is not None:
 
 ##### `SWAKVPool`（`mem_cache/swa_memory_pool.py`）
 
-| 字段 | 含义 |
-|------|------|
-| `full_kv_pool` | 全局注意力层的 KV cache 池，存储所有 token 的 KV（包括已被 SWA 窗口淘汰的），供 full attention 层使用 |
-| `swa_kv_pool` | 滑动窗口层的 KV cache 池，仅存储窗口内的 token KV。比 full pool 小得多 |
-| `layers_mapping` | 字典 `{layer_id: (pool内偏移, 是否SWA层)}`，将全局 layer ID 映射到对应池内的 layer 索引 |
-| `full_to_swa_index_mapping` | 张量，将 full pool 中的 token 索引映射到 swa pool 中的 token 索引。在 `alloc`/`alloc_extend`/`alloc_decode` 时更新 |
+| 字段 | 代码来源 |
+|------|---------|
+| `full_kv_pool` | `swa_memory_pool.py:79-84`：`token_to_kv_pool_class(size=size, ...)`。代码中无 inline comment。从构造参数推断：full attention 层的 KV cache 池（`size` = `full_max_total_num_tokens`） |
+| `swa_kv_pool` | `swa_memory_pool.py:71-76`：`token_to_kv_pool_class(size=size_swa, ...)`。代码中无 inline comment。从构造参数推断：SWA 层的 KV cache 池（`size_swa` = `swa_max_total_num_tokens`，容量小于 full pool） |
+| `layers_mapping` | `swa_memory_pool.py:86-91`：`Dict[int, Tuple[int, bool]]`。inline comment 原文：`# {layer_id: (index, is_swa_layer)}` |
+| `full_to_swa_index_mapping` | `swa_memory_pool.py:92`：`Optional[torch.Tensor] = None`。代码中无 inline comment。从赋值链路推断：在 `SWATokenToKVPoolAllocator` 中初始化并维护 full pool slot → swa pool slot 的映射 |
 
 ```python
-# swa_memory_pool.py 第 28-101 行
-class SWAKVPool(KVCache):
-    def __init__(self, size, size_swa, page_size, ...,
-                 swa_attention_layer_ids, full_attention_layer_ids, ...):
-        # SWA 层专用池（小，只存窗口内 token）
-        self.swa_kv_pool = token_to_kv_pool_class(size=size_swa, ...)
-        # Full 层专用池（大，存全部 token）
-        self.full_kv_pool = token_to_kv_pool_class(size=size, ...)
-        # 路由映射：layer_id -> (池内偏移, 是否SWA层)
-        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
-        for full_id, global_id in enumerate(full_attention_layer_ids):
-            self.layers_mapping[global_id] = (full_id, False)  # False = full 层
-        for swa_id, global_id in enumerate(swa_attention_layer_ids):
-            self.layers_mapping[global_id] = (swa_id, True)   # True = SWA 层
+# swa_memory_pool.py:71-92
+self.swa_kv_pool = token_to_kv_pool_class(
+    size=size_swa,
+    dtype=dtype,
+    layer_num=self.swa_layer_nums,
+    **kwargs,
+)
+kwargs.pop("swa_head_num", None)
+kwargs.pop("swa_head_dim", None)
+kwargs.pop("swa_v_head_dim", None)
+self.full_kv_pool = token_to_kv_pool_class(
+    size=size,
+    dtype=dtype,
+    layer_num=self.full_layer_nums,
+    **kwargs,
+)
+# {layer_id: (index, is_swa_layer)}
+self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
+for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
+    self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
+for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
+    self.layers_mapping[global_layer_id] = (swa_layer_id, True)
+self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 ```
 
-##### `SWATokenToKVPoolAllocator`（`mem_cache/swa_memory_pool.py`）
+**双池映射详解：为什么需要 `full_to_swa_index_mapping`？**
 
-| 字段 | 含义 |
-|------|------|
-| `full_attn_allocator` | full KV pool 的分配器，管理 full pool 的 slot 分配/释放 |
-| `swa_attn_allocator` | SWA KV pool 的分配器，管理 SWA pool 的 slot 分配/释放 |
-| `full_to_swa_index_mapping` | 维护 full pool slot → swa pool slot 的映射张量。每次分配 token 时同时分配两个池的 slot 并记录映射 |
+Gemma 4 有两种注意力层（SWA 层和 Full 层），使用两个独立的 KV cache 池。但调度器只维护一个统一的 token 索引空间（`req_to_token`），它只知道 full pool 的 slot 编号。当 SWA 层需要写入或读取 KV cache 时，需要知道对应的 swa pool slot。
+
+```
+假设请求正在生成第 5 个 token（seq_len=5）
+
+调度器分配了 full pool 的 slot 100-104 来存储这 5 个 token 的 KV：
+  req_to_token[req_idx] = [100, 101, 102, 103, 104]   ← full pool slots
+
+同时，SWA pool 也为这 5 个 token 分配了 slot 0-4：
+  swa pool slots = [0, 1, 2, 3, 4]
+
+full_to_swa_index_mapping 就是这个翻译表：
+  mapping[100] = 0    ← full slot 100 对应 swa slot 0
+  mapping[101] = 1    ← full slot 101 对应 swa slot 1
+  mapping[102] = 2
+  mapping[103] = 3
+  mapping[104] = 4
+```
+
+Full 层不需要这个映射——它直接使用 `req_to_token` 中的 full pool slot。只有 SWA 层需要翻译。代码中的翻译发生在 SWA 层 attention 计算前（`flashinfer_backend.py:1102-1204`）：
 
 ```python
-# swa_memory_pool.py 第 231-280 行
+if use_sliding_window_kv_pool:
+    kv_indices[:kv_last_index] = (
+        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            kv_indices[:kv_last_index]
+        )
+    )
+```
+
+类似的其他映射参数：
+
+| 参数 | 存在原因 | 例子 |
+|------|---------|------|
+| `out_cache_loc` | 调度器为本次 forward 预分配的 full pool 输出位置，新 token 的 KV 写到这里 | `[100, 101, 102]` = full pool 中 3 个空 slot |
+| `out_cache_loc_swa` | 同上的 SWA pool 版本。通过 `translate_loc_from_full_to_swa(out_cache_loc)` 得到 | `[0, 1, 2]` = swa pool 中对应的 slot |
+| `layers_mapping` | 全局 layer ID → 池内 layer 索引 + 是否 SWA 层。两个池的层数不同（full pool 有 N_full 层，swa pool 有 N_swa 层），需要知道每个 layer 对应哪个池的第几层 | `{0: (0, True), ..., 5: (0, False)}` = layer 0-4 是 SWA 层（映射到 swa pool 第 0-4 层），layer 5 是 Full 层（映射到 full pool 第 0 层） |
+
+一句话总结：所有这些映射存在的根本原因是**双池架构**——SWA 层和 Full 层各有自己的 KV cache 池，但调度器和 forward 流程只有一个统一的 token 索引空间，需要映射来连接两边。
+
+| 字段 | 代码来源 |
+|------|---------|
+| `full_attn_allocator` | `swa_memory_pool.py:260-267`（`page_size==1`）或 `:278-284`（`page_size>1`）：分配器绑定 `kvcache.full_kv_pool`。代码中无 inline comment。从构造参数推断：管理 full pool 的 slot 分配/释放 |
+| `swa_attn_allocator` | `swa_memory_pool.py:268-275`（`page_size==1`）或 `:285-291`（`page_size>1`）：分配器绑定 `kvcache.swa_kv_pool`。代码中无 inline comment。从构造参数推断：管理 SWA pool 的 slot 分配/释放 |
+| `full_to_swa_index_mapping` | `swa_memory_pool.py:294-309`。inline comment 原文：*"Note: append one more item of value -1 in the end so -1 maps to -1. It is needed for the last_loc in alloc_extend, where the first full_last_loc is -1, and we need to map it to swa_last_loc -1 as well."* |
+
+```python
+# swa_memory_pool.py:260-309 (简化)
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(self, size, size_swa, page_size, ...):
-        # Full pool 分配器
-        self.full_attn_allocator = PagedTokenToKVPoolAllocator(size, page_size, ...)
-        # SWA pool 分配器（独立管理，容量更小）
-        self.swa_attn_allocator = PagedTokenToKVPoolAllocator(size_swa, page_size, ...)
+        # ... page_size == 1 和 > 1 两个分支 ...
+        self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+            size, page_size, dtype, device, kvcache.full_kv_pool, need_sort,
+        )
+        self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+            size_swa, page_size, dtype, device, kvcache.swa_kv_pool, need_sort,
+        )
+        # Note: append one more item of value -1 in the end so -1 maps to -1.
+        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
+        # is -1, and we need to map it to swa_last_loc -1 as well.
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.zeros(size + self.page_size, dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=device),
+            ]
+        )
 ```
 
 ##### `SWARadixCache`（`mem_cache/swa_radix_cache.py`）
 
-| 字段 | 含义 |
-|------|------|
-| `sliding_window_size` | 窗口大小，用于计算淘汰边界 |
-| `full_lru_list` | Full KV 的 LRU 链表，用于全局淘汰（淘汰 full 叶子节点时同时释放 SWA） |
-| `swa_lru_list` | SWA KV 的 LRU 链表，用于仅 SWA 淘汰（保留 full KV，释放 SWA KV） |
-| `swa_tombstone` | 字典，标记 SWA KV 已被释放但 full KV 仍保留的节点（墓碑节点） |
+| 字段 | 代码来源 |
+|------|---------|
+| `sliding_window_size` | `swa_radix_cache.py`：`params.sliding_window_size`，用于 `_evict_swa()` 中计算淘汰边界 |
+| `full_lru_list` | `swa_radix_cache.py`：`LRUList(is_swa_list=False)`。`LRUList.__init__`（`:116-131`）中 `is_swa_list=False` 时使用 `prev/next/full_lock_ref` 属性。代码中无 inline comment |
+| `swa_lru_list` | `swa_radix_cache.py`：`LRUList(is_swa_list=True)`。`is_swa_list=True` 时使用 `swa_prev/swa_next/swa_lock_ref` 属性。代码中无 inline comment |
+| `swa_tombstone` | `TreeNode` 类中 inline comment 原文（`swa_radix_cache.py:66`）：*"swa_tombstone is used to indicate the kv indices have been freed for swa layers"*。`SWARadixCache` 中初始化为空 dict |
 
 ```python
-# swa_radix_cache.py 第 336-382 行
-class SWARadixCache(BasePrefixCache):
-    def __init__(self, params):
-        self.sliding_window_size = params.sliding_window_size
-        self.reset()
+# swa_radix_cache.py TreeNode 类 (行 66-90)
+# swa_tombstone is used to indicate the kv indices have been freed for swa layers
+self.swa_tombstone = False
+# invariant: for any node, if swa_lock_ref is locked, full_lock_ref must be locked;
+# if full_lock_ref is locked, swa_lock_ref doesn't need to be locked. So,
+# full_lock_ref is always >= swa_lock_ref.
+self.full_lock_ref = 0
+self.swa_lock_ref = 0
 
-    def reset(self):
-        # 双 LRU 链表：full 和 SWA 独立管理淘汰顺序
-        self.full_lru_list = LRUList(is_swa_list=False)
-        self.swa_lru_list = LRUList(is_swa_list=True)
-        self.swa_tombstone = {}  # 节点 -> 是否为墓碑（SWA KV 已释放）
+# swa_radix_cache.py LRUList 类 (行 116-131)
+def __init__(self, is_swa_list: bool = False):
+    self.is_swa_list = is_swa_list
+    if self.is_swa_list:
+        self.prv = "swa_prev"
+        self.nxt = "swa_next"
+        self.lock_ref = "swa_lock_ref"
+    else:
+        self.prv = "prev"
+        self.nxt = "next"
+        self.lock_ref = "full_lock_ref"
 ```
 
 ##### `ForwardBatch`（`model_executor/forward_batch_info.py`）
 
-| 字段 | 含义 |
-|------|------|
-| `out_cache_loc_swa` | SWA pool 中的输出位置索引。将 `out_cache_loc`（full pool 位置）翻译为 SWA pool 位置，供 SWA 层写入新 KV |
+| 字段 | 代码来源 |
+|------|---------|
+| `out_cache_loc_swa` | `forward_batch_info.py:302` 定义，inline comment 原文：*"The indices of output tokens in the token_to_kv_pool_swa"*。赋值（`:595-600`）通过 `translate_loc_from_full_to_swa()` 将 `out_cache_loc`（full pool 位置）翻译为 SWA pool 位置 |
 
 ```python
-# forward_batch_info.py 第 595-600 行
+# forward_batch_info.py:302 — 字段定义
+# The indices of output tokens in the token_to_kv_pool_swa
+out_cache_loc_swa: Optional[torch.Tensor] = None
+
+# forward_batch_info.py:595-600 — 赋值
 if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
     ret.out_cache_loc_swa = (
         model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -264,17 +717,25 @@ if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
 
 ##### `Req`（`managers/schedule_batch.py`）
 
-| 字段 | 含义 |
-|------|------|
-| `swa_evicted_seqlen` | 当前已释放的 SWA KV 最大序列位置。`[0, swa_evicted_seqlen)` 范围的 SWA KV 已被释放 |
-| `swa_uuid_for_lock` | SWA 操作的锁 UUID，用于并发安全 |
-| `cache_protected_len` | 基数树保护长度。`[0, cache_protected_len)` 范围的 KV 由基数树管理释放，不能在 `_evict_swa()` 中释放 |
+| 字段 | 代码来源 |
+|------|---------|
+| `swa_evicted_seqlen` | `schedule_batch.py:746`：初始值 `0`。`_evict_swa()` 中更新（`:2691`）：`req.swa_evicted_seqlen = new_swa_evicted_seqlen`。代码中无 inline comment。从赋值链路推断：`[0, swa_evicted_seqlen)` 范围的 SWA KV slot 已被释放 |
+| `swa_uuid_for_lock` | `schedule_batch.py:744`。inline comment 原文：*"The node to lock until for swa radix tree lock ref"* |
+| `cache_protected_len` | `schedule_batch.py:746`。inline comment 原文：*"The prefix length that is inserted into the tree cache"*。从 `match_result.cache_protected_len` 赋值（`:1043-1046`），在 `_evict_swa()` 中确保不释放此范围内的 SWA KV |
 
 ```python
-# schedule_batch.py Req 类字段
-self.swa_evicted_seqlen = 0       # 初始未淘汰任何 token
-self.swa_uuid_for_lock = None     # 并发控制
-self.cache_protected_len = 0      # 基数树保护边界
+# schedule_batch.py:744-746 — Req 类字段定义
+# The node to lock until for swa radix tree lock ref
+self.swa_uuid_for_lock: Optional[int] = None
+# The prefix length that is inserted into the tree cache
+self.cache_protected_len: int = 0
+self.swa_evicted_seqlen = 0
+
+# schedule_batch.py:1043-1046 — cache_protected_len 赋值
+if match_result.cache_protected_len is not None:
+    self.cache_protected_len = match_result.cache_protected_len
+else:
+    self.cache_protected_len = len(self.prefix_indices)
 ```
 
 #### 初始化序列（含代码引用）
