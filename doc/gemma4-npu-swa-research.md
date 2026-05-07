@@ -721,7 +721,7 @@ if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
 |------|---------|
 | `swa_evicted_seqlen` | `schedule_batch.py:746`：初始值 `0`。`_evict_swa()` 中更新（`:2691`）：`req.swa_evicted_seqlen = new_swa_evicted_seqlen`。代码中无 inline comment。从赋值链路推断：`[0, swa_evicted_seqlen)` 范围的 SWA KV slot 已被释放 |
 | `swa_uuid_for_lock` | `schedule_batch.py:744`。inline comment 原文：*"The node to lock until for swa radix tree lock ref"* |
-| `cache_protected_len` | `schedule_batch.py:746`。inline comment 原文：*"The prefix length that is inserted into the tree cache"*。从 `match_result.cache_protected_len` 赋值（`:1043-1046`），在 `_evict_swa()` 中确保不释放此范围内的 SWA KV |
+| `cache_protected_len` | `schedule_batch.py:746`。inline comment 原文：*"The prefix length that is inserted into the tree cache"*。`radix_cache.py:580-584` 的补充 inline comment：*"cache_protected_len is not always equal to len(req.prefix_indices) since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree"*。详见下方"cache_protected_len 领地边界"说明 |
 
 ```python
 # schedule_batch.py:744-746 — Req 类字段定义
@@ -736,6 +736,68 @@ if match_result.cache_protected_len is not None:
     self.cache_protected_len = match_result.cache_protected_len
 else:
     self.cache_protected_len = len(self.prefix_indices)
+
+# radix_cache.py:580-584 — 为什么不直接用 len(prefix_indices)
+# The cache_protected_len is not always equal to len(req.prefix_indices)
+# since for page_size > 1, the partial part is added to req.prefix_indices,
+# but that part of kv indices is not added to the tree.
+# It should be freed in the next cache_unfinished_req and final
+# cache_finished_req to avoid memory leak.
+req.cache_protected_len = len(new_indices)
+```
+
+**`cache_protected_len` 领地边界详解**
+
+关键前提：**radix tree 节点存的是 full pool 的 KV 索引，不是 SWA pool 的。**（`swa_radix_cache.py` 中 `swa_tombstone` inline comment：*"swa_tombstone is used to indicate the kv indices have been freed for swa layers"*）两个池有各自独立的生命周期。
+
+```
+=== 为什么 cache_protected_len ≠ len(prefix_indices)？ ===
+
+page_size=16，请求完成，序列长度 = 100 token
+
+radix tree 按 page 对齐存储：
+  100 // 16 * 16 = 96 → 前 96 个 token 能整页插入 radix tree
+  剩余 4 个 token (96-99) 无法构成完整 page，不插入树
+
+  len(prefix_indices) = 100  ← 全部 100 个 token 都有 prefix 索引
+  cache_protected_len  = 96   ← 只有 96 个 token 的 KV 在 radix tree 中
+
+  多出的 4 个 token (96-99) 的 KV 不在树中：
+  → cache_unfinished_req / cache_finished_req 负责释放它们
+  → 如果 cache_protected_len 错误地等于 100，这 4 个 token 的 KV 就泄漏了
+
+=== 在 _evict_swa 中的作用：领地边界 ===
+
+req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+
+这不是"保护 KV 不被释放"，而是领地声明：
+
+  [0, cache_protected_len)  → radix tree 的领地
+    - full KV 在 radix tree 节点中（用于多轮对话前缀匹配）
+    - SWA KV 由 radix tree 自己通过 tombstoning 管理
+    - _evict_swa 不碰这个区域
+
+  [cache_protected_len, seq_len) → _evict_swa 的领地
+    - 这些 token 不在 radix tree 中
+    - 它们的 SWA KV 由 _evict_swa 负责释放
+
+  把 swa_evicted_seqlen 推到 cache_protected_len，
+  后续 _evict_swa 只释放 [cache_protected_len, seq_len) 区域的 SWA KV。
+  如果 _evict_swa 也去释放 radix tree 领地内的 SWA KV，
+  会与 radix tree 的 tombstoning 机制冲突（double-free 或状态不一致）。
+
+=== 多轮对话完整流程 ===
+
+第一轮："什么是 SWA？" (100 token)
+  → cache_finished_req 将前 96 token (page 对齐) 插入 radix tree
+  → cache_protected_len = 96
+  → 释放剩余 4 token 的 KV（partial part）
+
+第二轮："详细解释一下" (复用第一轮缓存)
+  → radix tree match_prefix 命中 96 token 前缀
+  → _evict_swa 中：swa_evicted_seqlen = max(0, 96) = 96
+  → _evict_swa 只管理 [96, seq_len) 的 SWA KV
+  → [0, 96) 由 radix tree 管理，full KV 可被前缀匹配复用
 ```
 
 #### 初始化序列（含代码引用）
@@ -820,7 +882,7 @@ else:
 # schedule_batch.py 第 2661-2689 行
 def _evict_swa(self, req: Req, pre_len: int):
     sliding_window_size = self.tree_cache.sliding_window_size
-    # 确保基数树保护范围内的 KV 不被释放
+    # 领地边界：把淘汰指针推到 radix tree 的领地边界，后续只释放 radix tree 之外的 SWA KV
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
     # 计算新的淘汰边界
     new_swa_evicted_seqlen = max(
