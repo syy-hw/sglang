@@ -16,6 +16,21 @@ from sglang.srt.utils.common import (
     get_device_core_count,
     get_dispatch_device_backend,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
+
+    from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+        npu_add_rms_norm_batch_invariant,
+        npu_fused_infer_attention_score_batch_invariant,
+        npu_log_softmax_batch_invariant,
+        npu_matmul_batch_invariant,
+        npu_mean_batch_invariant,
+        npu_mm_batch_invariant,
+        npu_reduce_sum_batch_invariant,
+    )
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -983,20 +998,32 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
     # Register for detected device
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl(
-        "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
-    )
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)
-    _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
+    if not _is_npu:
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl(
+            "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
+        )
+        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
 
-    if enable_bmm:
-        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
-        # Also monkeypatch torch.bmm directly as a fallback
-        _original_torch_bmm = torch.bmm
-        torch.bmm = bmm_batch_invariant
+        if enable_bmm:
+            _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
+            # Also monkeypatch torch.bmm directly as a fallback
+            _original_torch_bmm = torch.bmm
+            torch.bmm = bmm_batch_invariant
+    else:
+        # NPU: register batch-invariant ops with "NPU" dispatch key
+        _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::matmul", npu_matmul_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::sum.dim", npu_reduce_sum_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::mean.dim", npu_mean_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::_log_softmax", npu_log_softmax_batch_invariant, "NPU")
+        torch.ops.npu.npu_fused_infer_attention_score = (
+            npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu.npu_add_rms_norm = npu_add_rms_norm_batch_invariant
 
 
 def disable_batch_invariant_mode():
