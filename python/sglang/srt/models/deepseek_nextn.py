@@ -185,13 +185,14 @@ class DeepseekModelNextN(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual, topk_indices = self.decoder(
+            hidden_states, residual, *rest = self.decoder(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
                 zero_allocator,
             )
+            topk_indices = rest[0] if rest else None
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:

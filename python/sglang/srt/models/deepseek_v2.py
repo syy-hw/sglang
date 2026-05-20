@@ -1205,10 +1205,21 @@ class DeepseekV2AttentionMLA(
                 self.next_skip_topk = False
             else:
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
+                self.index_skip_topk_offset = getattr(
+                    config, "index_skip_topk_offset", 2
+                )
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
                 if self.index_topk_pattern is None:
-                    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
-                    self.next_skip_topk = layer_id % self.index_topk_freq != 0
+                    self.skip_topk = (
+                        max(layer_id - self.index_skip_topk_offset + 1, 0)
+                        % self.index_topk_freq
+                        != 0
+                    )
+                    self.next_skip_topk = (
+                        max(layer_id - self.index_skip_topk_offset + 2, 0)
+                        % self.index_topk_freq
+                        != 0
+                    )
                 else:
                     self.skip_topk = self.index_topk_pattern[layer_id] == "S"
                     if layer_id < len(self.index_topk_pattern) - 1:
@@ -2058,7 +2069,7 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
+                hidden_states, residual, *rest = layer(
                     positions,
                     hidden_states,
                     forward_batch,
@@ -2068,6 +2079,7 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=topk_indices,
                 )
+                topk_indices = rest[0] if rest else None
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

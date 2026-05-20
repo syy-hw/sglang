@@ -13,13 +13,17 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     is_dp_attention_enabled,
+    set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -126,6 +130,11 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    if self.current_scheduler_metrics_enabled:
+                        self.log_prefill_stats(
+                            prefill_stats=self.mbs[next_mb_id].prefill_stats,
+                            can_run_cuda_graph=next_batch_result.can_run_cuda_graph,
+                        )
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         torch.cuda.current_stream().wait_event(self.launch_event)
@@ -225,7 +234,32 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+
+                need_mlp_sync = self.require_mlp_sync
+                skipped_mlp_sync = False
+                if (
+                    need_mlp_sync
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and self.server_args.enable_nsa_prefill_context_parallel
+                    and self.pp_size > 1
+                ):
+                    # In PD prefill CP+PP, MLP sync all_gather can deadlock on idle micro-batches.
+                    # Skip MLP sync here because decode-side MLP gather is not involved in this path.
+                    need_mlp_sync = False
+                    skipped_mlp_sync = True
+
+                batch = self.maybe_prepare_mlp_sync_batch(
+                    batch, need_sync=need_mlp_sync
+                )
+
+                if skipped_mlp_sync:
+                    # MLP sync was skipped but set_is_extend_in_batch is still needed
+                    # by the deepep dispatcher (called in model forward).
+                    is_extend = (
+                        batch.forward_mode.is_extend() if batch is not None else False
+                    )
+                    set_is_extend_in_batch(is_extend)
+
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -527,6 +561,11 @@ class SchedulerPPMixin:
         self.last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = (
             deque()
         )
+        # PP1 (last rank) stores its own batch outputs locally to avoid the
+        # PP1→PP0→PP1 round-trip that causes a deadlock in disagg prefill.
+        self.last_rank_local_result_queue: deque[
+            Tuple[torch.cuda.Event, PPProxyTensors]
+        ] = deque()
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -875,26 +914,26 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            lane_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
-                self.pp_rank * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + lane_offset,
                 self.world_group.cpu_group,
-                self.pp_rank * self.tp_size + dp_offset,
-                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + lane_offset,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + lane_offset,
                 async_send=async_send,
             )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            lane_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
-                self.pp_rank * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + lane_offset,
                 self.world_group.cpu_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + lane_offset,
+                self.pp_rank * self.tp_size + lane_offset,
             )
         else:
             data = None
@@ -1056,26 +1095,25 @@ class SchedulerPPMixin:
     ) -> List[P2PWork]:
         send_output_work = []
         if self.pp_group.is_last_rank:
-            # send ready PP output to rank 0
+            # Last rank: store outputs locally to avoid PP1->PP0->PP1 round-trip
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
                     torch.cuda.current_stream().wait_event(q_event)
+                    self.last_rank_local_result_queue.append(
+                        (q_event, pp_outputs_to_send)
+                    )
+        # send the outputs from the last round to let the next stage worker run post processing
+        # Second-to-last rank skips forwarding (last rank uses local queue instead)
+        if self.pp_rank != self.pp_size - 2:
+            if not self.pp_group.is_last_rank:
+                if pp_outputs:
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            pp_outputs.tensors,
                             async_send=True,
                             msg_type="output",
                         )
-        # send the outputs from the last round to let the next stage worker run post processing
-        if not self.pp_group.is_last_rank:
-            if pp_outputs:
-                with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                    send_output_work = self._pp_send_dict_to_next_stage(
-                        pp_outputs.tensors,
-                        async_send=True,
-                        msg_type="output",
-                    )
         return send_output_work
 
     def _pp_send_recv_and_preprocess_output_tensors(
@@ -1101,9 +1139,16 @@ class SchedulerPPMixin:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = None
                 if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                    next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
-                    )
+                    if self.pp_group.is_last_rank:
+                        # Last rank pops from local queue instead of receiving from prev stage
+                        _, local_pp_outputs = (
+                            self.last_rank_local_result_queue.popleft()
+                        )
+                        next_pp_outputs = local_pp_outputs
+                    else:
+                        next_pp_outputs = PPProxyTensors(
+                            self._pp_recv_dict_from_prev_stage()
+                        )
             if not mbs[next_mb_id].forward_mode.is_prebuilt():
                 with self.copy_stream_ctx:
                     self.copy_stream.wait_stream(self.schedule_stream)
@@ -1149,10 +1194,13 @@ class SchedulerPPMixin:
         """
         Used by PP, get the required rids with the given poll statuses.
         """
+        gloo_group = self.attn_tp_cpu_group
+        if self.attn_cp_size > 1:
+            gloo_group = self.tp_cpu_group
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
             self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            gloo_group,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:

@@ -74,6 +74,7 @@ from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
     get_attention_cp_group,
     get_attention_tp_group,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -121,6 +122,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    PostProcessWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -976,6 +978,12 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+        # SLIME profiling initialization
+        profiling_enabled = envs.SLIME_ENABLE_PROFILING.get()
+        self.pd_prefill_bootstrap_queue_durations = [] if profiling_enabled else None
+        self.pd_prefill_forward_durations = [] if profiling_enabled else None
+        self.pd_prefill_transfer_queue_durations = [] if profiling_enabled else None
+
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -1075,6 +1083,14 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
+            # When CP > 1, all CP ranks must agree on poll results so they all
+            # enter run_batch together; use the full TP gloo group for consensus.
+            disagg_prefill_gloo_group = (
+                self.tp_cpu_group
+                if self.attn_cp_size > 1
+                else self.attn_tp_cpu_group
+            )
+
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
@@ -1084,7 +1100,7 @@ class Scheduler(
                 tp_size=self.tp_size,
                 gpu_id=self.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=disagg_prefill_gloo_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
                 pp_rank=self.pp_rank,
@@ -1238,6 +1254,7 @@ class Scheduler(
                 (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
+                (PostProcessWeightsReqInput, self.post_process_weights),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -1331,6 +1348,12 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
+
+        # PP1 (last rank) stores its own batch outputs locally to avoid
+        # PP1->PP0->PP1 round-trip that causes a deadlock in disagg prefill.
+        self.last_rank_local_result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
@@ -1457,13 +1480,13 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                lane_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
-                    self.pp_rank * self.tp_size + dp_offset,
+                    self.pp_rank * self.tp_size + lane_offset,
                     self.world_group.cpu_group,
-                    (self.pp_rank - 1) * self.tp_size + dp_offset,
-                    self.pp_rank * self.tp_size + dp_offset,
+                    (self.pp_rank - 1) * self.tp_size + lane_offset,
+                    self.pp_rank * self.tp_size + lane_offset,
                 )
             else:
                 recv_reqs = None
@@ -2248,6 +2271,7 @@ class Scheduler(
             new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
+        skipped_mlp_sync = False
         if need_mlp_sync and not self.spec_algorithm.is_none():
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:
@@ -2813,7 +2837,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if batch.forward_mode.is_decode():
+        if batch.forward_mode.is_decode() or batch.forward_mode.is_idle():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
@@ -2824,8 +2848,6 @@ class Scheduler(
                 self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
-        elif batch.forward_mode.is_idle():
-            self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)

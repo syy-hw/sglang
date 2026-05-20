@@ -313,6 +313,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
+            self.send_to_scheduler_context = zmq.Context(1)
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
@@ -1383,7 +1384,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                self.send_to_scheduler.send_pyobj(obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1397,7 +1398,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1432,6 +1433,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message, num_paused_requests
+
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
@@ -1558,6 +1560,41 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+
+            # PD disaggregation timing
+            self._add_metric_if_present(
+                recv_obj, "pd_prefill_bootstrap_queue_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_prefill_forward_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_prefill_transfer_queue_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_decode_prealloc_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_decode_transfer_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_decode_forward_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_bootstrap_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_alloc_waiting_duration", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_transfer_speed_gb_s", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_transfer_total_mb", meta_info, i
+            )
+            self._add_metric_if_present(
+                recv_obj, "pd_prefill_retry_count", meta_info, i
+            )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -1942,6 +1979,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     i
                 ]
 
+    def _add_metric_if_present(
+        self,
+        recv_obj: Any,
+        attr_name: str,
+        meta_info: Dict[str, Any],
+        index: int,
+    ) -> None:
+        """Add a metric to meta_info if it exists and is not None."""
+        if (
+            hasattr(recv_obj, attr_name)
+            and getattr(recv_obj, attr_name)
+            and getattr(recv_obj, attr_name)[index] is not None
+        ):
+            meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
+
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
             obj.sampling_params.get("json_schema", None)
@@ -1965,25 +2017,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
-        if (
-            not state.ttft_observed
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
+        if not state.ttft_observed:
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
-            self.metrics_collector.observe_time_to_first_token(
-                labels, state.time_stats.get_first_token_latency()
-            )
+            if self.disaggregation_mode != DisaggregationMode.PREFILL:
+                self.metrics_collector.observe_time_to_first_token(
+                    labels, state.time_stats.get_first_token_latency()
+                )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
                     state.time_stats.get_interval(),
                     num_new_tokens,
                 )
                 state.time_stats.set_last_time()
-                state.last_completion_tokens = completion_tokens
+            state.last_completion_tokens = completion_tokens
 
         if state.finished:
             retraction_count = (

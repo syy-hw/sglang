@@ -52,11 +52,31 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
 
-        self.model = Glm4MoeModel(
-            config,
-            quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
+        if not getattr(self.config, "encoder_only", False):
+            self.model = Glm4MoeModel(
+                config,
+                quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.lm_head = None
+
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,
@@ -64,24 +84,14 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             use_data_parallel=self.use_data_parallel,
         )
 
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-                )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
-
+        _rope_cfg = (
+            getattr(self.config, "rope_scaling", None)
+            or getattr(self.config, "rope_parameters", None)
+            or {}
+        )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in _rope_cfg
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -145,6 +155,13 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+
+        # Skip loading visual/language model weights
+        if (
+            getattr(self.config, "encoder_only", False)
+            or getattr(self.config, "language_only", False)
+        ):
+            return
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -258,9 +275,16 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
-                    if "visual" in name:
+                    if "visual" in name or getattr(self.config, "encoder_only", False):
                         # adapt to VisionAttention for GLM-V
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+
+                    # Skip loading mm/language parameters
+                    if (
+                        getattr(self.config, "encoder_only", False)
+                        or getattr(self.config, "language_only", False)
+                    ):
+                        continue
 
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:

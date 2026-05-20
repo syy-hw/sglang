@@ -362,6 +362,17 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             load=recv_obj.load,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            pd_prefill_bootstrap_queue_duration=recv_obj.pd_prefill_bootstrap_queue_duration,
+            pd_prefill_forward_duration=recv_obj.pd_prefill_forward_duration,
+            pd_prefill_transfer_queue_duration=recv_obj.pd_prefill_transfer_queue_duration,
+            pd_decode_prealloc_duration=recv_obj.pd_decode_prealloc_duration,
+            pd_decode_transfer_duration=recv_obj.pd_decode_transfer_duration,
+            pd_decode_forward_duration=recv_obj.pd_decode_forward_duration,
+            pd_bootstrap_duration=recv_obj.pd_bootstrap_duration,
+            pd_alloc_waiting_duration=recv_obj.pd_alloc_waiting_duration,
+            pd_transfer_speed_gb_s=recv_obj.pd_transfer_speed_gb_s,
+            pd_transfer_total_mb=recv_obj.pd_transfer_total_mb,
+            pd_prefill_retry_count=recv_obj.pd_prefill_retry_count,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

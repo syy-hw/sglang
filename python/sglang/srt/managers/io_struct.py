@@ -70,6 +70,45 @@ class BaseReq(ABC):
 
 
 @dataclass
+class RequestTimingMetricsMixin:
+    # --- PD disaggregation timing fields ---
+    # All fields are None when profiling is disabled or not in PD disaggregation mode.
+
+    # P instance: duration spent in bootstrap queue before entering the wait queue.
+    pd_prefill_bootstrap_queue_duration: Optional[List[Optional[float]]]
+
+    # P instance: duration for the actual prefill forward computation.
+    pd_prefill_forward_duration: Optional[List[Optional[float]]]
+
+    # P instance: duration spent in the KV transfer queue.
+    pd_prefill_transfer_queue_duration: Optional[List[Optional[float]]]
+
+    # D instance: duration waiting for KV cache slot pre-allocation.
+    pd_decode_prealloc_duration: Optional[List[Optional[float]]]
+
+    # D instance: duration waiting for the KV cache transfer to complete.
+    pd_decode_transfer_duration: Optional[List[Optional[float]]]
+
+    # D instance: duration for the actual decode forward computation.
+    pd_decode_forward_duration: Optional[List[Optional[float]]]
+
+    # Bootstrap handshake duration (P and D instances).
+    pd_bootstrap_duration: Optional[List[Optional[float]]]
+
+    # KV cache allocation waiting duration (P and D instances).
+    pd_alloc_waiting_duration: Optional[List[Optional[float]]]
+
+    # KV cache transfer speed in GB/s.
+    pd_transfer_speed_gb_s: Optional[List[Optional[float]]]
+
+    # Total KV cache transferred in MB.
+    pd_transfer_total_mb: Optional[List[Optional[float]]]
+
+    # Number of prefill retries (P instance only).
+    pd_prefill_retry_count: Optional[List[Optional[int]]]
+
+
+@dataclass
 class BaseBatchReq(ABC):
     rids: Optional[List[str]] = field(default=None, kw_only=True)
     http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
@@ -958,7 +997,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 
 @dataclass
-class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+class BatchTokenIDOutput(BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
@@ -1026,7 +1065,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
 
 @dataclass
-class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+class BatchStrOutput(BaseBatchReq, RequestTimingMetricsMixin, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -1089,7 +1128,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
 
 @dataclass
-class BatchEmbeddingOutput(BaseBatchReq):
+class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
@@ -1334,6 +1373,18 @@ class UpdateWeightsFromIPCReqInput(BaseReq):
 
 @dataclass
 class UpdateWeightsFromIPCReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class PostProcessWeightsReqInput(BaseReq):
+    restore_weights_before_load: bool = False
+    post_process_quantization: bool = False
+
+
+@dataclass
+class PostProcessWeightsReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1753,6 +1804,10 @@ class GetLoadReqOutput(BaseReq):
     num_waiting_reqs: int
     num_tokens: int
     ts_tic: float
+    # Per-queue breakdown: list of {name, num_reqs, num_tokens, reqs: [{rid, seqlen, input_len, output_len}]}
+    queue_details: Optional[List[Dict[str, Any]]] = None
+    # Running batch info
+    running_details: Optional[Dict[str, Any]] = None
 
 
 @dataclass

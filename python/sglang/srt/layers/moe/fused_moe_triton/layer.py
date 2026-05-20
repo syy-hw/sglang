@@ -701,6 +701,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
                 ]
+                and "zero" not in weight_name
             )
             else loaded_weight
         )
@@ -860,13 +861,16 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=tp_rank,
-            )
+            if getattr(param, "load_full_w2", False) and shard_id == "w2":
+                expert_data.copy_(loaded_weight)
+            else:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
             return
 
         if (
@@ -920,6 +924,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
                 ]
+                and "zero" not in weight_name
             )
             else loaded_weight
         )

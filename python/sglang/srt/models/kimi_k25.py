@@ -696,38 +696,45 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
-        # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(
-            config.vision_config,
-            use_data_parallel=self.use_data_parallel,
-            quant_config=(
-                quant_config if isinstance(quant_config, ModelSlimConfig) else None
-            ),
-            prefix="vision_tower",
-        )
-        # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
-        self.language_model = DeepseekV3ForCausalLM(
-            config.text_config,
-            quant_config,
-            prefix=(
-                "language_model" if isinstance(quant_config, ModelSlimConfig) else ""
-            ),
-        )
+        is_encoder_only = getattr(config, "encoder_only", False)
+        is_language_only = getattr(config, "language_only", False)
 
-        self.model = self.language_model.model
+        if not is_language_only:
+            # Create vision tower
+            self.vision_tower = MoonViT3dPretrainedModel(
+                config.vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=(
+                    quant_config if isinstance(quant_config, ModelSlimConfig) else None
+                ),
+                prefix="vision_tower",
+            )
+            # Create mm projector
+            self.mm_projector = K2VLMultiModalProjector(config.vision_config)
+
+        if not is_encoder_only:
+            self.language_model = DeepseekV3ForCausalLM(
+                config.text_config,
+                quant_config,
+                prefix=(
+                    "language_model" if isinstance(quant_config, ModelSlimConfig) else ""
+                ),
+            )
+
+            self.model = self.language_model.model
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
-        if hasattr(self.language_model, "dtype"):
-            target_dtype = self.language_model.dtype
-            self.vision_tower = self.vision_tower.to(dtype=target_dtype)
-            self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+        if not is_language_only and not is_encoder_only:
+            if hasattr(self.language_model, "dtype"):
+                target_dtype = self.language_model.dtype
+                self.vision_tower = self.vision_tower.to(dtype=target_dtype)
+                self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.vision_tower.dtype
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            dtype=self.vision_tower.dtype, device=self.vision_tower.device
         )
         grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(
             self.vision_tower.device
@@ -798,6 +805,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
+        is_encoder_only = getattr(self.config, "encoder_only", False)
+        is_language_only = getattr(self.config, "language_only", False)
+
         # Separate vision tower weights and language model weights
         vision_weights = []
         language_weights = []
@@ -815,18 +825,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 language_weights.append((name, loaded_weight))
 
         # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
+        if not is_language_only:
+            vision_state_dict = dict(vision_weights)
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            for name, loaded_weight in vision_state_dict.items():
+                if name not in params_dict:
+                    raise ValueError(f"Weight {name} not found in params_dict")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                weight_loader(param, loaded_weight)
 
         # Load language model weights
-        if language_weights:
+        if not is_encoder_only and language_weights:
             self.language_model.load_weights(language_weights)
 
     @classmethod
@@ -838,33 +849,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
             num_groups=text_config.n_group,
         )
 
-    def set_eagle3_layers_to_capture(
-        self, layer_ids: Optional[List[int]] = None
-    ) -> None:
-        """Set the layers to capture for EAGLE3 speculative decoding."""
+    def set_eagle3_layers_to_capture(self, layer_ids=None):
         if not hasattr(self.language_model, "set_eagle3_layers_to_capture"):
-            raise AttributeError(
-                "language_model does not support EAGLE3 speculative decoding."
-            )
-
+            raise AttributeError("language_model does not support EAGLE3 speculative decoding.")
         self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get embedding and LM head weights for speculative decoding."""
+    def get_embed_and_head(self):
         if not hasattr(self.language_model, "get_embed_and_head"):
-            raise AttributeError(
-                "language_model does not support get_embed_and_head()."
-            )
-
+            raise AttributeError("language_model does not support get_embed_and_head().")
         return self.language_model.get_embed_and_head()
 
-    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
-        """Set embedding and LM head weights for speculative decoding."""
+    def set_embed_and_head(self, embed, head):
         if not hasattr(self.language_model, "set_embed_and_head"):
-            raise AttributeError(
-                "language_model does not support set_embed_and_head()."
-            )
-
+            raise AttributeError("language_model does not support set_embed_and_head().")
         self.language_model.set_embed_and_head(embed, head)
 
 

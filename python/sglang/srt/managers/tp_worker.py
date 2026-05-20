@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    PostProcessWeightsReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -168,6 +169,13 @@ class BaseTpWorker(ABC):
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
+        return success, message
+
+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
+        success, message = self.model_runner.post_process_weights(
+            restore_weights_before_load=recv_req.restore_weights_before_load,
+            post_process_quantization=recv_req.post_process_quantization,
+        )
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
