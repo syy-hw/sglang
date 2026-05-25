@@ -180,6 +180,8 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if get_global_server_args().rl_on_policy_target == "fsdp":
+            return self.forward_native(x, residual, post_residual_addition)
         if x.numel() == 0:
             return x
         if self.variance_size_override is not None:
@@ -213,6 +215,11 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            residual is not None
+            or get_global_server_args().rl_on_policy_target == "fsdp"
+        ):
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition

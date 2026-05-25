@@ -70,7 +70,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -128,9 +128,9 @@ def apply_rotary_pos_emb_npu(
     return q_embed, k_embed
 
 
-if _is_npu:
-    apply_rotary_pos_emb = apply_rotary_pos_emb_npu
-elif _is_cpu and _is_cpu_amx_available:
+# if _is_npu:
+#     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+if _is_cpu and _is_cpu_amx_available:
     apply_rotary_pos_emb = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu
 else:
     apply_rotary_pos_emb = apply_rotary_pos_emb_native

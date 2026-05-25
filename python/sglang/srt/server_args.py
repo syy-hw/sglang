@@ -3434,7 +3434,7 @@ class ServerArgs:
             logger.warning(
                 "Enable deterministic inference because of rl_on_policy_target."
             )
-            self.enable_deterministic_inference = True
+            # self.enable_deterministic_inference = True
 
             # For VLM
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"

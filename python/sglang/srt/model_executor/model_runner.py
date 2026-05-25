@@ -2771,7 +2771,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
-        if not self.is_draft_worker:
+        if not self.is_draft_worker and hasattr(self.graph_runner, "bs"):
             get_global_experts_capturer().on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,

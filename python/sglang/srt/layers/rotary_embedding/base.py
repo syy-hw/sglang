@@ -47,6 +47,18 @@ if _is_hip:
     )
 
 
+def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
+    """Apply interleaved MRoPE to 3D rotary embeddings.
+
+    Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+    interleaved [THTHWHTHW...TTT], preserving frequency continuity.
+    """
+    x_t = x[0].clone()
+    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
+    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
+    return x_t
+
+
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
 
@@ -69,7 +81,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        if not _is_cuda and not _is_npu:
             cache = cache.to(dtype)
 
         if (
@@ -101,9 +113,9 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                apply_rotary_emb
-            )
+            # self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
+            #     apply_rotary_emb
+            # )
         self.position_cos, self.position_sin = None, None
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
@@ -112,9 +124,7 @@ class RotaryEmbedding(MultiPlatformOp):
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
-        init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
-        )
+        init_device = "cpu"
         inv_freq = 1.0 / (
             base
             ** (
@@ -124,7 +134,9 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target is not None:
+        if _is_npu:
+            inv_freq = inv_freq.npu()
+        else:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -173,20 +185,37 @@ class RotaryEmbedding(MultiPlatformOp):
         )
 
     def get_cos_sin_with_position(self, positions):
-        assert positions.ndim == 1, (
-            "2D positions (multimodal RoPE) are not supported by the base "
-            "RotaryEmbedding. Override this method in a subclass (e.g. MRotaryEmbedding)."
-        )
-        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
-        last_dim = cos_sin.size()[-1]
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
-        )
-        # BSNH
-        self.position_cos, self.position_sin = (
-            cos.view(-1, 1, 1, last_dim).contiguous(),
-            sin.view(-1, 1, 1, last_dim).contiguous(),
-        )
+        assert positions.ndim == 1 or positions.ndim == 2
+        if positions.ndim == 1:
+            cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+            last_dim = cos_sin.size()[-1]
+            cos, sin = (
+                cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+            )
+            # BSNH
+            self.position_cos, self.position_sin = (
+                cos.view(-1, 1, 1, last_dim).contiguous(),
+                sin.view(-1, 1, 1, last_dim).contiguous(),
+            )
+        else:
+            assert self.mrope_section
+            cos_sin = self.cos_sin_cache[positions]
+            last_dim = cos_sin.size()[-1]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+            self.position_cos = cos.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
+            self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[:seqlen]
